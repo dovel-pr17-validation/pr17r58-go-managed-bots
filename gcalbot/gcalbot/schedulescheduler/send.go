@@ -1,0 +1,200 @@
+package schedulescheduler
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"math"
+	"strings"
+	"time"
+
+	"google.golang.org/api/calendar/v3"
+	"google.golang.org/api/googleapi"
+
+	"github.com/keybase/managed-bots/base"
+	"github.com/keybase/managed-bots/gcalbot/gcalbot"
+)
+
+func (s *ScheduleScheduler) sendDailyScheduleLoop(shutdownCh chan struct{}) error {
+	// sleep until the next half hour so that the loop executes at the beginning of each half hour
+	now := time.Now()
+	nextHalfHour := time.Date(now.Year(), now.Month(), now.Day(), now.Hour(), 30*(1+now.Minute()/30), 0, 0, time.Local)
+
+	select {
+	case <-shutdownCh:
+		return nil
+	case <-time.After(nextHalfHour.Sub(now)):
+	}
+
+	ticker := time.NewTicker(30 * time.Minute)
+	defer func() {
+		ticker.Stop()
+		s.Debug("shutting down sendDailyScheduleLoop")
+	}()
+
+	s.sendDailySchedulesForMinute(time.Now(), shutdownCh)
+	for {
+		select {
+		case <-shutdownCh:
+			return nil
+		case sendMinute := <-ticker.C:
+			s.sendDailySchedulesForMinute(sendMinute, shutdownCh)
+		}
+	}
+}
+
+func (s *ScheduleScheduler) sendDailySchedulesForMinute(sendMinute time.Time, shutdownCh chan struct{}) {
+	if sendMinute.Minute()%30 != 0 {
+		s.Errorf("daily schedule loop out of sync, sendMinute: %s", sendMinute.Format("15:04:05"))
+	}
+
+	var subscriptions []*gcalbot.AggregatedDailyScheduleSubscription
+
+	todaySubscriptions, err := s.db.GetAggregatedDailyScheduleSubscription(context.Background(), gcalbot.ScheduleToSendToday)
+	if err != nil {
+		s.Errorf("error getting daily schedule subscriptions to sync: %s", err)
+	}
+	subscriptions = todaySubscriptions
+
+	tomorrowSubscriptions, err := s.db.GetAggregatedDailyScheduleSubscription(context.Background(), gcalbot.ScheduleToSendTomorrow)
+	if err != nil {
+		s.Errorf("error getting daily schedule subscriptions to sync: %s", err)
+	}
+	subscriptions = append(subscriptions, tomorrowSubscriptions...)
+
+	for _, subscription := range subscriptions {
+		select {
+		case <-shutdownCh:
+			return
+		default:
+		}
+
+		s.SendDailyScheduleMessage(sendMinute, subscription)
+	}
+
+	s.stats.Value("sendDailySchedulesForMinute - duration - seconds", time.Since(sendMinute).Seconds())
+}
+
+func (s *ScheduleScheduler) SendDailyScheduleMessage(sendMinute time.Time, subscription *gcalbot.AggregatedDailyScheduleSubscription) {
+	userSendMinute := sendMinute.In(subscription.Timezone)
+	minutesSinceMidnight := float64(userSendMinute.Hour()*60 + userSendMinute.Minute())
+
+	// if the duration minutes are more than 5 minutes apart, return
+	if math.Abs(minutesSinceMidnight-subscription.NotificationTime.Minutes()) > 5 {
+		return
+	}
+
+	switch subscription.DaysToSend {
+	case gcalbot.DaysToSendEveryday:
+	case gcalbot.DaysToSendMonToFri:
+		switch userSendMinute.Weekday() {
+		case time.Saturday, time.Sunday:
+			return
+		}
+	case gcalbot.DaysToSendSunToThu:
+		switch userSendMinute.Weekday() {
+		case time.Friday, time.Saturday:
+			return
+		}
+	}
+
+	s.stats.Count("SendDailyScheduleMessage")
+	s.stats.CountMult("SendDailyScheduleMessage - calendars", len(subscription.CalendarIDs))
+
+	ctx := context.Background()
+	account := &subscription.Account
+	var err error
+	defer func() {
+		if err = s.cal.WrapAuth(ctx, account, err); err != nil {
+			s.Errorf("unable to send daily schedule: %s", err)
+		}
+	}()
+
+	srv, err := s.cal.GetCalendarService(ctx, account)
+	if err != nil {
+		return
+	}
+
+	var minTime time.Time
+	switch subscription.ScheduleToSend {
+	case gcalbot.ScheduleToSendToday:
+		minTime = time.Date(userSendMinute.Year(), userSendMinute.Month(), userSendMinute.Day(), 0, 0, 0, 0, subscription.Timezone)
+	case gcalbot.ScheduleToSendTomorrow:
+		minTime = time.Date(userSendMinute.Year(), userSendMinute.Month(), userSendMinute.Day()+1, 0, 0, 0, 0, subscription.Timezone)
+	}
+	maxTime := minTime.Add(24 * time.Hour)
+
+	format24HourTime, err := gcalbot.GetUserFormat24HourTime(srv)
+	if err != nil {
+		return
+	}
+
+	calendarSummaries := make([]string, len(subscription.CalendarIDs))
+	var events []*calendar.Event
+	for index, calendarID := range subscription.CalendarIDs {
+		cal, calErr := srv.Calendars.Get(calendarID).Fields("summary").Do()
+		if calErr != nil {
+			if base.ShouldRetryAuth(calErr) {
+				err = calErr
+				return
+			}
+			var gerr *googleapi.Error
+			if errors.As(calErr, &gerr) && gerr.Code == 404 {
+				// Calendar was deleted or user lost access; use ID as display name
+				s.Debug("calendar no longer accessible (404): %s", calendarID)
+			} else {
+				s.Errorf("error getting calendar summary from API: %s", calErr)
+			}
+			calendarSummaries[index] = calendarID // use the cal id if there is an error
+		} else {
+			calendarSummaries[index] = cal.Summary
+		}
+		err = srv.Events.
+			List(calendarID).
+			TimeMin(minTime.Format(time.RFC3339)).
+			TimeMax(maxTime.Format(time.RFC3339)).
+			SingleEvents(true).
+			OrderBy("startTime").
+			Pages(ctx, func(page *calendar.Events) error {
+				events = append(events, page.Items...)
+				return nil
+			})
+		if err != nil {
+			if base.ShouldRetryAuth(err) {
+				return
+			}
+			s.Debug("error getting events from API: %s", err)
+			err = nil
+			continue
+		}
+	}
+
+	message := `Here is what's happening %s, *%s*
+Account: %s
+Calendars: %s
+%s
+%s`
+
+	date := minTime.Format("Monday, January 2")
+
+	calendarList := strings.Join(calendarSummaries, ", ")
+
+	link := fmt.Sprintf("https://calendar.google.com/calendar/r/day/%d/%d/%d",
+		userSendMinute.Year(), userSendMinute.Month(), userSendMinute.Day())
+
+	var formattedSchedule string
+	if len(events) == 0 {
+		formattedSchedule = "> You have no events today :sunny:"
+	} else {
+		formattedSchedule, err = gcalbot.FormatEventSchedule(events, subscription.Timezone, format24HourTime)
+		if err != nil {
+			s.Errorf("unable to format schedule: %s", err)
+			err = nil
+			return
+		}
+	}
+
+	s.ChatEcho(subscription.KeybaseConvID, message,
+		subscription.ScheduleToSend, date, subscription.Account.AccountNickname, calendarList,
+		formattedSchedule, link)
+}

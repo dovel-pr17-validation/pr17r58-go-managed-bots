@@ -1,0 +1,210 @@
+package main
+
+import (
+	"database/sql"
+	"flag"
+	"fmt"
+	"os"
+
+	_ "github.com/go-sql-driver/mysql"
+	"github.com/keybase/go-keybase-chat-bot/kbchat"
+	"github.com/keybase/go-keybase-chat-bot/kbchat/types/chat1"
+	"github.com/keybase/managed-bots/base"
+	"github.com/keybase/managed-bots/elastiwatch/elastiwatch"
+	"github.com/opensearch-project/opensearch-go/v4"
+	"github.com/opensearch-project/opensearch-go/v4/opensearchapi"
+	"golang.org/x/sync/errgroup"
+)
+
+type Options struct {
+	*base.Options
+	ESAddress   string
+	Index       string
+	Email       string
+	SenderEmail string
+	AlertConvID chat1.ConvIDStr
+	EmailConvID chat1.ConvIDStr
+	Team        string
+}
+
+func NewOptions() *Options {
+	return &Options{
+		Options: base.NewOptions(),
+	}
+}
+
+type BotServer struct {
+	*base.Server
+
+	opts Options
+	kbc  *kbchat.API
+}
+
+func NewBotServer(opts Options) *BotServer {
+	return &BotServer{
+		Server: base.NewServer("elastiwatch", opts.Announcement, opts.AWSOpts, opts.MultiDSN, opts.ReadSelf, kbchat.RunOptions{
+			KeybaseLocation: opts.KeybaseLocation,
+			HomeDir:         opts.Home,
+			DebugTag:        opts.DebugTag,
+		}),
+		opts: opts,
+	}
+}
+
+const (
+	backs = "```"
+	back  = "`"
+)
+
+func (s *BotServer) makeAdvertisement() kbchat.Advertisement {
+	deferExtended := fmt.Sprintf(`Defer reporting on logs lines that match the given regular expression. Useful if there is a known error spamming emails that is not a problem
+
+	Example:%s
+		!elastiwatch defer error loading .*%s`, backs, backs)
+	unDeferExtended := fmt.Sprintf(`Remove a currently active log deferral. Deferrals IDs can be found by running %s!elastiwatch list-defers%s.
+
+	Example:%s
+		!elastiwatch undefer 2%s`, back, back, backs, backs)
+
+	cmds := []chat1.UserBotCommandInput{
+		{
+			Name:        "elastiwatch defer",
+			Description: "Defer logs matching a regular expression",
+			ExtendedDescription: &chat1.UserBotExtendedDescription{
+				Title: `*!elastiwatch defer* <regex>
+Defer logs`,
+				DesktopBody: deferExtended,
+				MobileBody:  deferExtended,
+			},
+		},
+		{
+			Name:        "elastiwatch list-defers",
+			Description: "List active list-defers",
+		},
+		{
+			Name:        "elastiwatch dump",
+			Description: "Dump currently held log lines",
+		},
+		{
+			Name:        "elastiwatch undefer",
+			Description: "Remove deferral",
+			ExtendedDescription: &chat1.UserBotExtendedDescription{
+				Title: `*!elastiwatch undefer* <deferral index>
+Remove deferral`,
+				DesktopBody: unDeferExtended,
+				MobileBody:  unDeferExtended,
+			},
+		},
+	}
+	return kbchat.Advertisement{
+		Alias: "Elastiwatch",
+		Advertisements: []chat1.AdvertiseCommandAPIParam{
+			{
+				Typ:      "teamconvs",
+				Commands: cmds,
+				TeamName: s.opts.Team,
+			},
+		},
+	}
+}
+
+func (s *BotServer) Go() (err error) {
+	if s.kbc, err = s.Start(s.opts.ErrReportConv); err != nil {
+		return err
+	}
+	sdb, err := sql.Open("mysql", s.opts.DSN.FormatDSN())
+	if err != nil {
+		s.Errorf("failed to connect to MySQL: %s", err)
+		return err
+	}
+	defer func() {
+		if cerr := sdb.Close(); cerr != nil {
+			fmt.Printf("failed to close DB: %v\n", cerr)
+		}
+	}()
+	db := elastiwatch.NewDB(sdb)
+	s.Debug("Connect to Elasticsearch at %s", s.opts.ESAddress)
+	var emailer base.Emailer
+	emailer = base.DummyEmailer{}
+	debugConfig := base.NewChatDebugOutputConfig(s.kbc, s.opts.ErrReportConv)
+	stats, err := base.NewStatsRegistry(debugConfig, s.opts.ShowtrendsAddr)
+	if err != nil {
+		s.Errorf("failed to initialize stats: %s", err)
+	}
+	if s.opts.AWSOpts != nil {
+		s.Debug("Using AWS HTTP client: region: %s", s.opts.AWSOpts.AWSRegion)
+		emailer = base.NewSESEmailer(s.opts.SenderEmail, s.opts.AWSOpts.AWSRegion, debugConfig)
+	}
+
+	cli, err := opensearchapi.NewClient(
+		opensearchapi.Config{
+			Client: opensearch.Config{
+				Addresses: []string{s.opts.ESAddress},
+			},
+		},
+	)
+	if err != nil {
+		s.Errorf("unable to connect to Elasticsearch: %s", err)
+		return err
+	}
+	s.Debug("Connected to ElasticSearch")
+
+	logwatch := elastiwatch.NewLogWatch(cli, db, s.opts.Index, s.opts.Email, emailer, s.opts.AlertConvID,
+		s.opts.EmailConvID, debugConfig)
+	httpSrv := elastiwatch.NewHTTPSrv(stats, s.kbc, debugConfig, db)
+	handler := elastiwatch.NewHandler(s.kbc, debugConfig, httpSrv, db, logwatch, s.opts.Team)
+	eg := &errgroup.Group{}
+	s.GoWithRecover(eg, func() error { return s.Listen(handler) })
+	s.GoWithRecover(eg, httpSrv.Listen)
+	s.GoWithRecover(eg, func() error { return s.HandleSignals(httpSrv, logwatch, stats) })
+	s.GoWithRecover(eg, func() error { return logwatch.Run() })
+	s.GoWithRecover(eg, func() error { return s.AnnounceAndAdvertise(s.makeAdvertisement(), "I live.") })
+	if err := eg.Wait(); err != nil {
+		s.Debug("wait error: %s", err)
+		return err
+	}
+	return nil
+}
+
+func main() {
+	rc := mainInner()
+	os.Exit(rc)
+}
+
+func mainInner() int {
+	opts := NewOptions()
+	fs := flag.NewFlagSet(os.Args[0], flag.ExitOnError)
+	var alertConvID, emailConvID string
+	fs.StringVar(&opts.ESAddress, "esaddress", os.Getenv("ESADDRESS"), "Elasticsearch address")
+	fs.StringVar(&opts.Index, "index", os.Getenv("INDEX"), "OpenSearch index pattern(s), comma-separated")
+	fs.StringVar(&opts.Email, "email", os.Getenv("EMAIL"), "Destination email address")
+	fs.StringVar(&opts.SenderEmail, "sender-email", os.Getenv("SENDER_EMAIL"), "Sourceemail address")
+	fs.StringVar(&opts.Team, "team", os.Getenv("TEAM"), "Team")
+	fs.StringVar(&alertConvID, "alert-convid", os.Getenv("ALERT_CONVID"), "Alerting conv id")
+	fs.StringVar(&emailConvID, "email-convid", os.Getenv("EMAIL_CONVID"), "Email conv id")
+
+	if err := opts.Parse(fs, os.Args); err != nil {
+		fmt.Printf("Unable to parse options: %v\n", err)
+		return 3
+	}
+	if opts.DSN == nil {
+		fmt.Printf("must specify a database DSN\n")
+		return 3
+	}
+	if len(opts.ESAddress) == 0 {
+		fmt.Printf("must specify a ElasticSearch address\n")
+		return 3
+	}
+	if len(opts.Index) == 0 {
+		fmt.Printf("must specify a ElasicSearch index\n")
+		return 3
+	}
+	if len(opts.Team) == 0 {
+		fmt.Printf("must specify a team to operate in\n")
+		return 3
+	}
+	opts.AlertConvID = chat1.ConvIDStr(alertConvID)
+	opts.EmailConvID = chat1.ConvIDStr(emailConvID)
+	bs := NewBotServer(*opts)
+	return base.RunBot(bs.Server, bs.Go)
+}

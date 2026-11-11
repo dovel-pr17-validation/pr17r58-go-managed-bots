@@ -1,0 +1,143 @@
+package main
+
+import (
+	"database/sql"
+	"flag"
+	"fmt"
+	"os"
+
+	_ "github.com/go-sql-driver/mysql"
+
+	"github.com/keybase/managed-bots/macrobot/macrobot"
+
+	"github.com/keybase/go-keybase-chat-bot/kbchat"
+	"github.com/keybase/go-keybase-chat-bot/kbchat/types/chat1"
+	"github.com/keybase/managed-bots/base"
+	"golang.org/x/sync/errgroup"
+)
+
+type BotServer struct {
+	*base.Server
+
+	opts base.Options
+	kbc  *kbchat.API
+}
+
+func NewBotServer(opts base.Options) *BotServer {
+	return &BotServer{
+		Server: base.NewServer("macrobot", opts.Announcement, opts.AWSOpts, opts.MultiDSN, opts.ReadSelf, kbchat.RunOptions{
+			KeybaseLocation: opts.KeybaseLocation,
+			HomeDir:         opts.Home,
+			DebugTag:        opts.DebugTag,
+		}),
+		opts: opts,
+	}
+}
+
+const (
+	back  = "`"
+	backs = "```"
+)
+
+func (s *BotServer) makeAdvertisement() kbchat.Advertisement {
+	createDesc := fmt.Sprintf("Create or update a macro for the current team or conversation. %s",
+		fmt.Sprintf(macrobot.CreateCmdHelp, backs, backs, back, back, back, back))
+	removeDesc := fmt.Sprintf(`Remove a macro from the current team or conversation. You must specify the name of the macro.
+
+Examples:%s
+!macro remove docs
+!macro remove lunchflip%s`,
+		backs, backs)
+
+	cmds := []chat1.UserBotCommandInput{
+		{
+			Name:        "macro create",
+			Description: "Create or update a macro for the current team or conversation",
+			ExtendedDescription: &chat1.UserBotExtendedDescription{
+				Title:       `*!macro create* <name> <message>`,
+				DesktopBody: createDesc,
+				MobileBody:  createDesc,
+			},
+		},
+		{
+			Name:        "macro list",
+			Description: "List available macros for the current team or conversation",
+		},
+		{
+			Name:        "macro remove",
+			Description: "Remove a macro from the current team or conversation",
+			ExtendedDescription: &chat1.UserBotExtendedDescription{
+				Title:       `*!macro remove* <name>`,
+				DesktopBody: removeDesc,
+				MobileBody:  removeDesc,
+			},
+		},
+		base.GetFeedbackCommandAdvertisement(s.kbc.GetUsername()),
+	}
+	return kbchat.Advertisement{
+		Alias: "Macro Bot",
+		Advertisements: []chat1.AdvertiseCommandAPIParam{
+			{
+				Typ:      "public",
+				Commands: cmds,
+			},
+		},
+	}
+}
+
+func (s *BotServer) Go() (err error) {
+	if s.kbc, err = s.Start(s.opts.ErrReportConv); err != nil {
+		return err
+	}
+	sdb, err := sql.Open("mysql", s.opts.DSN.FormatDSN())
+	if err != nil {
+		s.Errorf("failed to connect to MySQL: %s", err)
+		return err
+	}
+	defer func() {
+		if cerr := sdb.Close(); cerr != nil {
+			fmt.Printf("failed to close DB: %v\n", cerr)
+		}
+	}()
+	db := macrobot.NewDB(sdb)
+
+	debugConfig := base.NewChatDebugOutputConfig(s.kbc, s.opts.ErrReportConv)
+	stats, err := base.NewStatsRegistry(debugConfig, s.opts.ShowtrendsAddr)
+	if err != nil {
+		s.Debug("unable to create stats: %v", err)
+		return err
+	}
+	stats = stats.SetPrefix(s.Name())
+	handler := macrobot.NewHandler(stats, s.kbc, debugConfig, db)
+	httpSrv := macrobot.NewHTTPSrv(stats, debugConfig)
+	eg := &errgroup.Group{}
+	s.GoWithRecover(eg, func() error { return s.Listen(handler) })
+	s.GoWithRecover(eg, httpSrv.Listen)
+	s.GoWithRecover(eg, func() error { return s.HandleSignals(httpSrv, stats) })
+	s.GoWithRecover(eg, func() error { return s.AnnounceAndAdvertise(s.makeAdvertisement(), "I live.") })
+	if err := eg.Wait(); err != nil {
+		s.Debug("wait error: %s", err)
+		return err
+	}
+	return nil
+}
+
+func main() {
+	rc := mainInner()
+	os.Exit(rc)
+}
+
+func mainInner() int {
+	opts := base.NewOptions()
+	fs := flag.NewFlagSet(os.Args[0], flag.ExitOnError)
+	if err := opts.Parse(fs, os.Args); err != nil {
+		fmt.Printf("Unable to parse options: %v\n", err)
+		return 3
+	}
+	if opts.DSN == nil {
+		fmt.Printf("must specify a database DSN\n")
+		return 3
+	}
+	bs := NewBotServer(*opts)
+	return base.RunBot(bs.Server, bs.Go)
+}

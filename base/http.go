@@ -1,0 +1,34 @@
+package base
+
+import (
+	"context"
+	"net/http"
+	"time"
+)
+
+type HTTPSrv struct {
+	*DebugOutput
+	srv   *http.Server
+	Stats *StatsRegistry
+}
+
+func NewHTTPSrv(stats *StatsRegistry, debugConfig *ChatDebugOutputConfig) *HTTPSrv {
+	return &HTTPSrv{
+		DebugOutput: NewDebugOutput("HTTPSrv", debugConfig),
+		Stats:       stats.SetPrefix("HTTPSrv"),
+		srv: &http.Server{
+			Addr:              ":8080",
+			ReadHeaderTimeout: 10 * time.Second,
+		},
+	}
+}
+
+func (h *HTTPSrv) Listen() (err error) {
+	defer h.Trace(&err, "ListenAndServe")()
+	return h.srv.ListenAndServe()
+}
+
+func (h *HTTPSrv) Shutdown() (err error) {
+	defer h.Trace(&err, "Shutdown")()
+	return h.srv.Shutdown(context.Background())
+}

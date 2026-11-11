@@ -1,0 +1,72 @@
+package reminderscheduler
+
+import (
+	"fmt"
+	"time"
+
+	"github.com/keybase/managed-bots/gcalbot/gcalbot"
+)
+
+func (r *ReminderScheduler) sendReminderLoop(shutdownCh chan struct{}) error {
+	// sleep until the next minute so that the loop executes at the beginning of each minute
+	now := time.Now()
+	nextMinute := time.Date(now.Year(), now.Month(), now.Day(), now.Hour(), now.Minute()+1, 0, 0, time.Local)
+
+	select {
+	case <-shutdownCh:
+		return nil
+	case <-time.After(nextMinute.Sub(now)):
+	}
+
+	ticker := time.NewTicker(time.Minute)
+	defer func() {
+		ticker.Stop()
+		r.Debug("shutting down sendReminderLoop")
+	}()
+
+	r.sendReminders(time.Now())
+	for {
+		select {
+		case <-shutdownCh:
+			return nil
+		case sendMinute := <-ticker.C:
+			r.sendReminders(sendMinute)
+		}
+	}
+}
+
+func (r *ReminderScheduler) sendReminders(sendMinute time.Time) {
+	timestamp := getReminderTimestamp(sendMinute, 0)
+	r.minuteReminders.ForEachReminderMessageInMinute(timestamp, func(msg *ReminderMessage) {
+		for duration := range msg.MinuteReminders {
+			msgTimestamp := getReminderTimestamp(msg.StartTime, duration)
+			if msgTimestamp == timestamp {
+				minutesBefore := gcalbot.GetMinutesFromDuration(duration)
+				var eventSummary string
+				if msg.EventSummary != "" {
+					eventSummary = fmt.Sprintf(`"%s"`, msg.EventSummary)
+				} else {
+					eventSummary = "An event"
+				}
+				var message string
+				if minutesBefore == 0 {
+					message = fmt.Sprintf("%s is starting now: %s", eventSummary, msg.MsgContent)
+				} else {
+					message = fmt.Sprintf("%s is starting in %s: %s",
+						eventSummary, gcalbot.MinutesBeforeString(minutesBefore), msg.MsgContent)
+				}
+				r.ChatEcho(msg.KeybaseConvID, "%s", message)
+				delete(msg.MinuteReminders, duration)
+				r.stats.Count("sendReminders - reminder")
+			}
+		}
+		if len(msg.MinuteReminders) == 0 {
+			r.subscriptionReminders.RemoveReminderMessageFromSubscription(msg)
+			r.eventReminders.RemoveReminderMessageFromEvent(msg)
+			// the entire minute will be removed, and since this is the event's last minute there is no need to delete 'all' minutes
+		}
+	})
+	r.minuteReminders.RemoveMinute(timestamp)
+	sendDuration := time.Since(sendMinute)
+	r.stats.Value("sendReminders - duration - seconds", sendDuration.Seconds())
+}
